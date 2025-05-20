@@ -1,104 +1,137 @@
 """
-streamlit_app.py  –  GUI web local para tu calibrador
-Ejecuta con:  streamlit run streamlit_app.py
+streamlit_app.py – GUI Streamlit para el Calibrator
+· Arrastra tus indicadores (.ex5), template BlockSettings.sqb y JSON de calibración
+· Si no subes master_mapping.json se generará automáticamente
+· Descarga un .zip con todos los outputs
+
+Ejecuta:  streamlit run streamlit_app.py
 """
 
+from pathlib import Path
 import streamlit as st
-import tempfile, os, sys, io, contextlib, logging
-from main import main as run_cli  # tu función principal
+import tempfile, os, sys, io, contextlib, logging, zipfile, shutil
+from main import main as run_cli  # tu CLI
 
-ICON_PATH = "./el-comercio-de-acciones.png"
-# ---------- UI ----------------------------------------------------------------
-# st.set_page_config(
-#     page_title="Calibrator",
-#     # layout="wide",
-#     page_icon="./el-comercio-de-acciones.png",
-# )
-# st.image(ICON_PATH, width=200)
-# st.title("Calibrator")
+# ─────────────────── Estilo cabecera ────────────────────────────────────────
+ICON_PATH = "./el-comercio-de-acciones.png"  # cambia por tu icono
+SCRIPT_DIR = Path(__file__).resolve().parent
 
-col_icon, col_title = st.columns([1, 8])  # 1/8 de ancho
-
+col_icon, col_title = st.columns([1, 8])
 with col_icon:
-    st.image(ICON_PATH, width=220)
-
+    st.image(ICON_PATH, width=200)
 with col_title:
-    # Ajusta `margin` para centrar verticalmente
     st.markdown("<h1 style='margin:0.3em 0'>Calibrator</h1>", unsafe_allow_html=True)
 
+# ───────────────────── Entradas ─────────────────────────────────────────────
+st.header("Entradas")
 
-st.header("1️⃣  Entradas")
-mt5_folder = st.text_input("**Carpeta con indicadores MT5**")
+indicator_files = st.file_uploader(
+    "**Indicadores MT5 (.ex5)** 📁 (Opcional)",
+    type="ex5",
+    accept_multiple_files=True,
+    help="Se prioriza el tener un archivo JSON de mappeo de indicadores. Si no lo tienes, sube los .ex5 aquí.",
+)
 sbq_file = st.file_uploader(
-    "**Template SQX BlockSettings.sqb**"
-)  # acepta cualquier extensión
-calib_file = st.file_uploader("**Archivo de calibración JSON**")
-activo = st.text_input("**Activo**", "NDX")
-genmap = st.checkbox("Generar/actualizar mapping.json", value=True)
+    "**Archivo template BlockSettings.sqb** 📁",
+    help="Archivo template procedente del Bulding Block de SQX",
+)
+calib_file = st.file_uploader(
+    "**Archivo de calibración JSON** 📁",
+    type="json",
+    help="Archivo generado en MT5 tras realizar la calibración",
+)
+mapping_up = st.file_uploader("**Archivo JSON de mapeo** 📁", type="json")
 
-# Contenedor donde luego pondremos los logs
+activo = st.text_input("_Activo_", "NDX", help="Nombre del activo a calibrar")
+
+regenerar = st.checkbox(
+    "Regenerar mapping",
+    value=False,
+    help="Si marcas esto, se ignorará el mapping subido y se creará uno nuevo.",
+)
+
 log_placeholder = st.empty()
 
-# ---------- Ejecución ---------------------------------------------------------
+# ─────────────────── Ejecutar ───────────────────────────────────────────────
 if st.button("Ejecutar"):
-    if not (mt5_folder and sbq_file and calib_file):
-        st.warning("Faltan datos: selecciona carpeta MT5, BlockSettings y calibración.")
+    if not (indicator_files and sbq_file and calib_file):
+        st.warning("Debes subir: indicadores, BlockSettings y calibración.")
         st.stop()
 
-    with tempfile.TemporaryDirectory() as tmp, st.spinner("Procesando…"):
-        # Guardar los ficheros subidos
-        sbq_path = os.path.join(tmp, sbq_file.name)
-        calib_path = os.path.join(tmp, calib_file.name)
-        with open(sbq_path, "wb") as f:
-            f.write(sbq_file.getbuffer())
-        with open(calib_path, "wb") as f:
-            f.write(calib_file.getbuffer())
+    with tempfile.TemporaryDirectory() as tmpdir, st.spinner("Procesando…"):
+        tmp = Path(tmpdir)
 
-        # Construir flags que espera parse_args()
-        args_cli = []
-        if genmap:
-            args_cli.append("-m")  # --generate-mapping
-        args_cli += [
+        # 1) Guardar indicadores en tmp/Indicators/
+        indicators_dir = tmp / "Indicators"
+        indicators_dir.mkdir()
+        for f in indicator_files:
+            (indicators_dir / f.name).write_bytes(f.getbuffer())
+
+        # 2) Guardar template SBQ y calibración JSON
+        sbq_path = tmp / sbq_file.name
+        calib_path = tmp / calib_file.name
+        sbq_path.write_bytes(sbq_file.getbuffer())
+        calib_path.write_bytes(calib_file.getbuffer())
+
+        # 3) Determinar mapping
+        mapping_path = tmp / "master_mapping.json"
+        if mapping_up is not None and not regenerar:
+            mapping_path.write_bytes(mapping_up.getbuffer())
+            mapping_flag = []  # usar mapping subido
+        else:
+            mapping_flag = ["-m"]  # --generate-mapping (creará mapping_path)
+
+        # 4) Construir flags para main.py
+        args_cli = mapping_flag + [
             "--indicators",
-            mt5_folder,
+            str(indicators_dir),
             "--block-settings",
-            sbq_path,
+            str(sbq_path),
             "--calibration-file",
-            calib_path,
+            str(calib_path),
+            "--mapping-file",
+            str(mapping_path),
             "--activo",
             activo,
         ]
 
-        # ----------------- Captura de stdout / stderr / logging -----------------
+        # 5) Capturar stdout / stderr / logging
         buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            log_handler = logging.StreamHandler(buf)
+            root_logger = logging.getLogger()
+            prev_handlers = root_logger.handlers[:]
+            root_logger.handlers = [log_handler]
 
-        # 1) stdout + stderr
-        redir_out = contextlib.redirect_stdout(buf)
-        redir_err = contextlib.redirect_stderr(buf)
-
-        # 2) logging (root)
-        log_handler = logging.StreamHandler(buf)
-        log_handler.setLevel(logging.DEBUG)
-        logging_root = logging.getLogger()  # raíz
-        prev_handlers = logging_root.handlers[:]  # copia
-        logging_root.handlers = [log_handler]
-
-        # 3) simular línea de comandos
-        prev_argv = sys.argv[:]
-        sys.argv = ["calibrator_streamlit"] + args_cli
-
-        try:
-            with redir_out, redir_err:
+            prev_cwd, prev_argv = os.getcwd(), sys.argv[:]
+            os.chdir(tmp)
+            sys.argv = ["calibrator_streamlit"] + args_cli
+            try:
                 run_cli()  # main() sin args
-        except SystemExit as e:
-            print(f"[exit code {e.code}]")
-        finally:
-            # restaurar estado
-            sys.argv = prev_argv
-            logging_root.handlers = prev_handlers
+            except SystemExit as e:
+                print(f"[exit code {e.code}]")
+            finally:
+                os.chdir(prev_cwd)
+                sys.argv = prev_argv
+                root_logger.handlers = prev_handlers
 
-        # -----------------------------------------------------------------------
-        logs = buf.getvalue()
-        log_placeholder.text_area("Salida del proceso", logs, height=400)
+        log_placeholder.text_area("Salida del proceso", buf.getvalue(), height=420)
 
-    st.success("Proceso finalizado ✅")
+        # 6) Empaquetar outputs → ZIP  (excluye inputs y el propio zip)
+        zip_path = tmp / "calibrator_outputs.zip"
+        exclude = {sbq_path, calib_path, zip_path} | set(indicators_dir.glob("*"))
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for p in tmp.rglob("*"):
+                if p.is_file() and p not in exclude:
+                    z.write(p, p.relative_to(tmp))
+
+        # 7) Botón de descarga
+        with zip_path.open("rb") as f:
+            st.download_button(
+                "📦 Descargar resultados (.zip)",
+                data=f,
+                file_name="calibrator_outputs.zip",
+                mime="application/zip",
+            )
+
+    st.success("¡Proceso finalizado y paquete listo para descargar! ✅")
