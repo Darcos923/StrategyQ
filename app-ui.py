@@ -54,8 +54,8 @@ log_placeholder = st.empty()
 
 # ─────────────────── Ejecutar ───────────────────────────────────────────────
 if st.button("Ejecutar"):
-    if not (indicator_files and sbq_file and calib_file):
-        st.warning("Debes subir: indicadores, BlockSettings y calibración.")
+    if not (sbq_file and calib_file):
+        st.warning("Debes subir mínimo: BlockSettings y calibración.")
         st.stop()
 
     with tempfile.TemporaryDirectory() as tmpdir, st.spinner("Procesando…"):
