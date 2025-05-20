@@ -46,7 +46,7 @@ pydantic_core==2.33.2
 pydeck==0.9.1
 pydub==0.25.1
 Pygments==2.19.1
-PySimpleGUI==5.0.10
+PySimpleGUI
 python-dateutil==2.9.0.post0
 python-multipart==0.0.20
 pytz==2025.2
