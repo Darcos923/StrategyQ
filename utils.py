@@ -6,6 +6,7 @@ import xml.etree.ElementTree as ET
 import re, json, difflib
 import json
 import logging
+import io
 
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -79,7 +80,45 @@ def get_sqx_indicators(
             continue  # ignoramos los no marcados
 
         indicators.add(key.split(".", 1)[1])  # quitamos 'Indicators.'
+        # Guardar indicadores en un archivo .txt
+        with open("indicators.txt", "w", encoding="utf-8") as f:
+            for indicator in sorted(indicators):
+                f.write(f"{indicator}\n")
+    return sorted(indicators)
 
+
+def extract_indicators_from_sqb(
+    sqb_file: str | Path, extra_indicators: list[str] | None = None
+) -> list[str]:
+    """
+    Lee un archivo .sqb generado por StrategyQuant / AlgoWizard, localiza
+    el archivo config.xml que contiene la definición de bloques
+    y extrae todas las entradas cuyo atributo category=\"indicators\".
+
+    :param sqb_file: Ruta al archivo .sqb
+    :param extra_indicators: Lista opcional de nombres adicionales
+                             (p.e. los que ves en la imagen)
+    :return: Lista de nombres de indicadores, sin duplicados y ordenada
+    """
+    extras = set(extra_indicators or [])
+    indicators = set()
+
+    # -- 1. abrir el contenedor ZIP (.sqb) --
+    with zipfile.ZipFile(sqb_file) as z:
+        # el .sqb siempre contiene un único config.xml
+        if "config.xml" not in z.namelist():
+            raise ValueError("config.xml no encontrado dentro del .sqb")
+        xml_bytes = z.read("config.xml")
+
+    # -- 2. parsear el XML de manera incremental (consume poca RAM) --
+    for event, elem in ET.iterparse(io.BytesIO(xml_bytes), events=("start",)):
+        if elem.tag == "Block" and elem.get("category") == "indicators":
+            key = elem.get("key")
+            if key:
+                indicators.add(key)
+
+    # -- 3. incorporar los indicadores extra y devolver la lista ordenada --
+    indicators.update(extras)
     return sorted(indicators)
 
 
@@ -149,171 +188,117 @@ def mapping_indicators(
     print(f"🏁 Mapeo completado: {OUT_FILE}")
 
 
-# ──────────────────────────────────────────────────────────────
-# 1. Generar NEW_RANGES_<TF>.json
-# ──────────────────────────────────────────────────────────────
-def build_ranges_jsons(
-    mapping_file: str | Path,
-    calibration_file: str | Path,
-    activo: str,
-    out_dir: str | Path = "./ranges_by_tf",
-    decimals: int = 6,
-) -> None:
-    """
-    Crea un JSON de rangos por timeframe con claves *externas* (ADX, ATR…).
-
-    Ej.: ``ranges_by_tf/NDX_M15.json``
-
-    Args:
-        mapping_file:      Path al mapping maestro {externo: interno}.
-        calibration_file:  JSON con los datos MT5 multi-timeframe.
-        activo:            Prefijo del archivo de salida (NDX, SPX, …).
-        out_dir:           Carpeta de destino para los JSON.
-        decimals:          Nº de decimales a redondear.
-    """
-    out_dir = Path(out_dir)
-    out_dir.mkdir(exist_ok=True)
-
-    mapping: Dict[str, str] = json.loads(Path(mapping_file).read_text())
-    mt5_multi = json.loads(Path(calibration_file).read_text())
-
-    for idx, tf in enumerate(mt5_multi["timeframes"], start=1):
-        tf_name = tf.get("tf") or tf.get("timeframe") or tf.get("name") or f"tf{idx}"
-
-        # Agrupar registros por código interno
-        by_code: Dict[str, List[dict]] = {}
-        for rec in tf["datos"]:
-            by_code.setdefault(rec["indicador"], []).append(rec)
-
-        # Construir rangos con claves externas
-        ranges: Dict[str, Tuple[float, float, float]] = {}
-        for ext, internal in mapping.items():
-            registros = by_code.get(internal)
-            if not registros:
-                continue
-            mins = [r["minimo"] for r in registros]
-            maxs = [r["maximo"] for r in registros]
-            pasos = [r["paso"] for r in registros]
-            ranges[ext] = (
-                round(min(mins), decimals),
-                round(max(maxs), decimals),
-                round(min(pasos), decimals),
-            )
-
-        out_path = out_dir / f"{activo}_{tf_name}.json"
-        out_path.write_text(
-            json.dumps(ranges, indent=2, sort_keys=True, ensure_ascii=False)
-        )
-        log.info("Creado %s (%d indicadores)", out_path, len(ranges))
-
-
-# ──────────────────────────────────────────────────────────────
-# 2. Helpers para parchear config.xml
-# ──────────────────────────────────────────────────────────────
-_TRUE_VALUES = {"1", "true", "yes"}
-
-
 def _is_true(value: str | None) -> bool:
-    return value and value.lower() in _TRUE_VALUES
+    return bool(value and value.lower() in {"1", "true", "yes"})
 
 
 def _patch_block(
-    block: ET.Element, ranges: Dict[str, Tuple[float, float, float]]
+    block: ET.Element,
+    mapping: dict[str, str],
+    datos_map: dict[str, tuple[float, float, float]],
 ) -> None:
     """
-    Sustituye indicatorMin/Max/Step siempre que el indicador figure en `ranges`,
-    tanto si está activado (use="true") como si no.
-
-    Args:
-        block:  Nodo <Block> del XML.
-        ranges: Diccionario {nombre_externo: (min, max, step)}.
+    Parchar un <Block> tanto de categoría "indicators" como "stopLimitBlocks",
+    usando mapping para convertir raw_key -> nombre en datos_map,
+    y actualiza los atributos indicatorMin, indicatorMax, indicatorStep.
     """
-    key = block.get("key", "")
-    if not key.startswith("Indicators."):
+    cat = block.get("category", "")
+    raw_key = block.get("key", "")
+    # Normalizar la clave:
+    # - indicators suelen venir como "Indicators.<Name>" o solo "<Name>"
+    # - stopLimitBlocks como "Stop/Limit Price Ranges.<Name>"
+    if "." in raw_key:
+        raw_key = raw_key.split(".", 1)[1]
+
+    # Ahora raw_key coincide con las claves de mapping.json
+    if raw_key not in mapping:
         return
 
-    # Nombre externo (ADX, ATR, …)
-    name = key.split(".", 1)[1]
-
-    rng = ranges.get(name)
-    if not rng:
-        log.debug("  %s sin rango definido (se deja intacto)", name)
+    val_name = mapping[raw_key]
+    if val_name not in datos_map:
         return
 
-    # Solo para log: saber si estaba marcado como 'usado'
-    attrs = {k.lower(): v for k, v in block.attrib.items()}
-    in_use = _is_true(attrs.get("use") or attrs.get("enabled") or attrs.get("selected"))
+    minimo, maximo, paso = datos_map[val_name]
 
-    # Parchear los atributos de rango
-    block.set("indicatorMin", str(rng[0]))
-    block.set("indicatorMax", str(rng[1]))
-    block.set("indicatorStep", str(rng[2]))
-
+    # Para diagnóstico
+    in_use = (
+        _is_true(block.get("use"))
+        or _is_true(block.get("enabled"))
+        or _is_true(block.get("selected"))
+    )
     log.debug(
-        "  %s (%s) → min=%s  max=%s  step=%s",
-        name,
-        "ON" if in_use else "OFF",
-        *rng,
+        "Patching %s (cat=%s, in_use=%s): min=%s max=%s step=%s",
+        raw_key,
+        cat,
+        in_use,
+        minimo,
+        maximo,
+        paso,
     )
 
-
-# ──────────────────────────────────────────────────────────────
-# 3. Generar .sbq a partir de un dict de rangos
-# ──────────────────────────────────────────────────────────────
-def generate_sqb(
-    template: str | Path,
-    output: str | Path,
-    ranges: Dict[str, Tuple[float, float, float]],
-    xml_inside: str = "config.xml",
-) -> None:
-    """Escribe *output* copiando *template* y parcheando sus rangos."""
-    template = Path(template)
-    output = Path(output)
-
-    with zipfile.ZipFile(template, "r") as zin, zipfile.ZipFile(
-        output, "w", zipfile.ZIP_DEFLATED
-    ) as zout:
-        for item in zin.infolist():
-            data = zin.read(item.filename)
-
-            if item.filename == xml_inside:
-                root = ET.fromstring(data)
-                for blk in root.findall(".//Block"):
-                    _patch_block(blk, ranges)
-                data = ET.tostring(root, encoding="utf-8")
-
-            zout.writestr(item, data)
-
-    log.info("✔  Generado %s", output)
+    # Reemplaza los atributos en el propio <Block>
+    block.set("indicatorMin", str(minimo))
+    block.set("indicatorMax", str(maximo))
+    block.set("indicatorStep", str(paso))
 
 
-# ──────────────────────────────────────────────────────────────
-# 4. Orquestador: un .sbq por timeframe
-# ──────────────────────────────────────────────────────────────
-def batch_generate_sqb(
-    ranges_dir: str | Path,
-    template_sbq: str | Path,
+def generate_sqb_per_timeframe(
+    template_sqb: Path,
+    mapping_json: Path,
+    mt5_calibrated_json: Path,
+    output_dir: Path,
     activo: str,
-    out_dir: str | Path = "./calibrated_sqb",
-    xml_inside: str = "config.xml",
-) -> None:
+) -> list[Path]:
     """
-    Recorre todos los JSON de rangos y produce un .sqb calibrado por cada uno.
+    Lee template_sqb, master mapping y valores.json, y genera un .sqb
+    por cada timeframe, parchando los atributos indicatorMin/Max/Step
+    en cada <Block> de categorías "indicators" y "stopLimitBlocks".
     """
-    ranges_dir = Path(ranges_dir)
-    out_dir = Path(out_dir)
-    out_dir.mkdir(exist_ok=True)
+    # 1) Cargar mapping y valores
+    mapping = json.loads(mapping_json.read_text(encoding="utf-8"))
+    valores = json.loads(mt5_calibrated_json.read_text(encoding="utf-8"))
 
-    json_files = sorted(ranges_dir.glob("*.json"))
-    if not json_files:
-        raise FileNotFoundError(f"No hay JSON de rangos en {ranges_dir}")
+    # Construir dict de timeframes -> { indicador_en_valores.json: (min, max, step) }
+    tf_dict: dict[str, dict[str, tuple[float, float, float]]] = {}
+    for tf_block in valores.get("timeframes", []):
+        tf = tf_block.get("timeframe")
+        datos_map = {
+            d["indicador"]: (d["minimo"], d["maximo"], d["paso"])
+            for d in tf_block.get("datos", [])
+        }
+        tf_dict[tf] = datos_map
 
-    log.info("Plantilla usada: %s", template_sbq)
-    log.info("Encontrados %d timeframes", len(json_files))
+    # 2) Leer config.xml original y resto de archivos
+    with zipfile.ZipFile(template_sqb, "r") as zin:
+        xml_bytes = zin.read("config.xml")
+        other_files = {
+            item.filename: zin.read(item.filename)
+            for item in zin.infolist()
+            if item.filename != "config.xml"
+        }
 
-    for jf in json_files:
-        tf_name = jf.stem.split("_")[-1]  # p.e. NDX_M15 → M15
-        ranges = json.loads(jf.read_text())
-        out_sbq = out_dir / f"{Path(template_sbq).stem}_{activo}_{tf_name}.sqb"
-        log.info("→ Timeframe %s", tf_name)
-        generate_sqb(template_sbq, out_sbq, ranges, xml_inside)
+    # Prepara carpeta de salida
+    output_dir.mkdir(parents=True, exist_ok=True)
+    generated = []
+
+    # 3) Para cada timeframe, parchear y escribir nuevo .sqb
+    for tf, datos_map in tf_dict.items():
+        root = ET.fromstring(xml_bytes)
+        for block in root.findall(".//Block"):
+            cat = block.get("category", "")
+            if cat in ("indicators", "stopLimitBlocks"):
+                _patch_block(block, mapping, datos_map)
+
+        new_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        out_path = output_dir / f"{template_sqb.stem}_{activo}_{tf}.sqb"
+
+        with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            zout.writestr("config.xml", new_xml)
+            for name, data in other_files.items():
+                zout.writestr(name, data)
+
+        log.info("Generado %s", out_path.name)
+        generated.append(out_path)
+
+    log.info("Total: %d archivos .sqb creados en '%s'", len(generated), output_dir)
+    return generated
