@@ -5,7 +5,6 @@ main.py – Flujo completo: mapping.json  ➜  NEW_RANGES_<TF>.json  ➜  *.sbq
 Ejecución típica:
     python main.py --indicators ./mt5_indicators \
                    --block-settings ./BlockSettings.sqb \
-                   --xml config.xml \
                    --mapping-file ./master_mapping.json \
                    --calibration-file ./NDX_MULTI_2025.05.19_12-41.json \
                    --activo NDX
@@ -22,8 +21,7 @@ from utils import (
     get_mt5_indicators,
     get_sqx_indicators,
     mapping_indicators,
-    build_ranges_jsons,
-    batch_generate_sqb,
+    generate_sqb_per_timeframe,
 )
 
 # ──────────────────────────────────────────────────────────────
@@ -73,25 +71,15 @@ def calibrate_block_settings(
     activo: str,
 ) -> None:
     """
-    1) Genera NEW_RANGES_<TF>.json en ./ranges_by_tf
-    2) Crea un BlockSettings_<TF>.sbq por cada timeframe en ./calibrated_sbq
+    Genera archivos .sbq calibrados por cada marco temporal.
     """
-    log.info("Generando JSON de rangos desde %s", calibration_file)
-    build_ranges_jsons(
-        mapping_file=mapping_file,
-        calibration_file=calibration_file,
-        activo=activo,
-        out_dir="./ranges_by_tf",
-        decimals=6,
-    )
-
     log.info("Creando .sbq calibrados usando plantilla %s", sbq_template)
-    batch_generate_sqb(
-        ranges_dir="./ranges_by_tf",
-        template_sbq=sbq_template,
+    generate_sqb_per_timeframe(
+        template_sqb=sbq_template,
+        mapping_json=mapping_file,
+        mt5_calibrated_json=calibration_file,
+        output_dir=Path("./calibrated_sqb"),
         activo=activo,
-        out_dir="./calibrated_sqb",
-        xml_inside="config.xml",
     )
     log.info("✔ Todos los .sbq generados en ./calibrated_sqb/")
 
@@ -101,24 +89,23 @@ def calibrate_block_settings(
 # ──────────────────────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Genera mapping.json, NEW_RANGES_<TF>.json y BlockSettings_<TF>.sbq"
+        description="Genera BlockSettings_<TF>.sbq y posible mapping.json",
     )
 
     parser.add_argument("--indicators", type=Path, default=Path("./mt5_indicators"))
     parser.add_argument(
-        "--block-settings", type=Path, default=Path("./BlockSettings.sqb")
+        "--block-settings", type=Path, default=Path("./TemplateBlockSettings.sqb")
     )
-    parser.add_argument("--xml", default="config.xml", help="Ruta del XML interno")
+    # parser.add_argument("--xml", default="config.xml", help="Ruta del XML interno")
     parser.add_argument("--activo", default="NDX", help="Símbolo/activo a calibrar")
     parser.add_argument(
-        "--mapping-file", type=Path, default=Path("./master_mapping.json")
+        "--mapping-file", type=Path, default=Path("./template_master_mapping.json")
     )
     parser.add_argument(
         "--calibration-file",
         type=Path,
-        default=Path("./NDX_MULTI_2025.05.19_19-41.json"),
+        default=Path("./valores.json"),
     )
-
     parser.add_argument(
         "-m",
         "--generate-mapping",
@@ -150,3 +137,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
