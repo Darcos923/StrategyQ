@@ -4,7 +4,7 @@ streamlit_app.py – GUI Streamlit para el Calibrator
 · Si no subes master_mapping.json se generará automáticamente
 · Descarga un .zip con todos los outputs
 
-Ejecuta:  streamlit run streamlit_app.py
+Ejecuta:  streamlit run app-ui.py
 """
 
 from pathlib import Path
